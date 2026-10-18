@@ -1,393 +1,132 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b1020">
-  <meta name="description" content="Read-only Shodan IP host lookup dashboard.">
-  <title>NetScope — Shodan IP Lookup</title>
-
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0b1020;
-      --panel: #121a2d;
-      --border: #293650;
-      --text: #edf3ff;
-      --muted: #9baac3;
-      --accent: #65e6bd;
-      --danger: #ff9292;
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: system-ui, sans-serif;
-      line-height: 1.6;
-    }
-
-    header, footer { border-color: var(--border); }
-
-    header { border-bottom: 1px solid var(--border); }
-
-    .shell {
-      width: min(1000px, calc(100% - 32px));
-      margin: auto;
-    }
-
-    .nav {
-      min-height: 72px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .brand { font-size: 22px; font-weight: 800; }
-
-    .brand span { color: var(--accent); }
-
-    .status {
-      color: var(--accent);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-
-    main { padding: 48px 0 64px; }
-
-    .eyebrow {
-      color: var(--accent);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 2px;
-      text-transform: uppercase;
-    }
-
-    h1 {
-      font-size: clamp(34px, 7vw, 54px);
-      line-height: 1.1;
-      letter-spacing: -1.5px;
-      margin: 12px 0;
-    }
-
-    .intro, .muted { color: var(--muted); }
-
-    .panel, .card, .service {
-      border: 1px solid var(--border);
-      background: var(--panel);
-      border-radius: 14px;
-    }
-
-    .panel { margin-top: 26px; padding: 20px; }
-
-    label {
-      display: block;
-      margin-bottom: 8px;
-      font-weight: 700;
-    }
-
-    .search {
-      display: flex;
-      gap: 10px;
-    }
-
-    input {
-      min-width: 0;
-      flex: 1;
-      padding: 13px;
-      background: #080d18;
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 9px;
-      font: inherit;
-    }
-
-    button {
-      padding: 12px 18px;
-      border: 0;
-      border-radius: 9px;
-      background: var(--accent);
-      color: #07131b;
-      font: inherit;
-      font-weight: 800;
-      cursor: pointer;
-    }
-
-    button:disabled { opacity: .6; }
-
-    #message {
-      margin-top: 12px;
-      overflow-wrap: anywhere;
-      color: var(--muted);
-    }
-
-    #message.error { color: var(--danger); }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-    }
-
-    .card { padding: 16px; min-width: 0; }
-
-    .label {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-
-    .value {
-      margin-top: 6px;
-      font-size: 16px;
-      font-weight: 750;
-      overflow-wrap: anywhere;
-    }
-
-    h2 { margin-top: 28px; font-size: 19px; }
-
-    .ports { display: flex; flex-wrap: wrap; gap: 8px; }
-
-    .port {
-      padding: 6px 10px;
-      border: 1px solid #345044;
-      border-radius: 8px;
-      color: var(--accent);
-      background: #142c2a;
-      font-family: monospace;
-    }
-
-    .service { padding: 15px; margin-top: 12px; }
-
-    .service pre {
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      overflow: auto;
-      max-height: 250px;
-      background: #080d18;
-      padding: 12px;
-      border-radius: 8px;
-      color: #c7d5ec;
-      font-size: 12px;
-    }
-
-    footer {
-      border-top: 1px solid var(--border);
-      padding: 22px 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    @media (max-width: 650px) {
-      .grid { grid-template-columns: 1fr; }
-      .search { flex-direction: column; }
-      .search button { width: 100%; }
-      main { padding-top: 32px; }
-    }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#090d17">
+  <meta name="description" content="NetScope — Shodan-powered IP intelligence dashboard.">
+  <title>NetScope — IP Intelligence</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
 </head>
-
 <body>
-  <header>
-    <div class="shell nav">
-      <div class="brand"><span>◆</span> NetScope</div>
-      <div class="status">Read-only lookup</div>
-    </div>
+  <header class="topbar">
+    <a class="brand" href="./">
+      <span class="brand-icon">N</span>
+      <span>Net<span class="accent">Scope</span></span>
+    </a>
+
+    <span class="topbar-label">
+      <span class="live-dot"></span>
+      IP INTELLIGENCE
+    </span>
   </header>
 
-  <main class="shell">
-    <div class="eyebrow">Network intelligence</div>
-    <h1>Public IP inventory.</h1>
-    <p class="intro">
-      View host information already indexed by Shodan.
-      NetScope does not scan target systems or attempt authentication.
-    </p>
+  <main class="container">
+    <section class="hero">
+      <p class="eyebrow">NETWORK RECONNAISSANCE</p>
+      <h1>Explore an <span class="gradient-text">IP address.</span></h1>
+      <p class="subtitle">
+        Inspect publicly indexed ports, services, network ownership
+        and service banners using Shodan data.
+      </p>
 
-    <section class="panel">
-      <form id="lookup-form">
-        <label for="ip">IP address</label>
-        <div class="search">
-          <input id="ip" value="185.118.49.198"
-            placeholder="Enter an IP address"
-            autocomplete="off" spellcheck="false" required>
-          <button id="submit" type="submit">Look up IP</button>
-        </div>
+      <form id="search-form" class="search-form">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input
+          id="ip-input"
+          type="text"
+          value="185.118.49.198"
+          placeholder="Enter an IP address"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="IP address"
+          required
+        >
+        <button id="search-button" type="submit">
+          <span id="button-label">Analyze IP</span>
+          <span aria-hidden="true">→</span>
+        </button>
       </form>
-      <div id="message" role="status" aria-live="polite"></div>
+
+      <p class="search-hint">
+        Passive lookup only · No port scanning is performed
+      </p>
+
+      <div id="status" class="status" role="status" aria-live="polite" hidden></div>
     </section>
 
     <section id="results" hidden>
-      <h2>Host overview</h2>
-      <div id="overview" class="grid"></div>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">ANALYSIS REPORT</p>
+          <h2 id="result-ip">IP Overview</h2>
+        </div>
+        <a id="shodan-link" class="external-link"
+           href="https://www.shodan.io/" target="_blank" rel="noopener noreferrer">
+          View on Shodan ↗
+        </a>
+      </div>
 
-      <h2>Observed ports</h2>
-      <div id="ports" class="ports"></div>
+      <div class="stats-grid">
+        <article class="stat-card">
+          <span class="stat-label">Open Ports</span>
+          <strong id="port-count">—</strong>
+          <span class="stat-note">Indexed services</span>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">Services</span>
+          <strong id="service-count">—</strong>
+          <span class="stat-note">Reported banners</span>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">Country</span>
+          <strong id="country-stat">—</strong>
+          <span class="stat-note">Reported location</span>
+        </article>
+      </div>
 
-      <h2>Service banners</h2>
-      <div id="services"></div>
+      <div class="content-grid">
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>Host information</h3>
+            <span class="panel-symbol">◈</span>
+          </div>
+          <div id="overview" class="info-list"></div>
+        </section>
 
-      <p id="updated" class="muted"></p>
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>Open ports</h3>
+            <span class="panel-symbol">⇄</span>
+          </div>
+          <div id="ports" class="ports-list"></div>
+        </section>
+      </div>
+
+      <section class="panel banners-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>Service banners</h3>
+            <p class="panel-description">
+              Data returned by Shodan for each indexed service.
+            </p>
+          </div>
+          <span id="banner-count" class="count-badge">0 banners</span>
+        </div>
+        <div id="banners" class="banners-list"></div>
+      </section>
+
+      <p class="disclaimer">
+        Shodan data is not necessarily real-time or complete. A listed port
+        does not guarantee that a service is currently reachable.
+      </p>
     </section>
+
+    <footer class="footer">
+      <span>NetScope</span>
+      <span>Built with HTML, CSS & JavaScript</span>
+    </footer>
   </main>
-
-  <footer>
-    <div class="shell">
-      NetScope displays existing Shodan inventory data.
-      Data can be incomplete or outdated. Only access systems you are
-      authorized to use.
-    </div>
-  </footer>
-
-  <script>
-    /*
-     * Direct browser requests may be blocked by Shodan CORS policy.
-     * This method also exposes the API key to website visitors.
-     * Use only for a temporary personal test, never for public deployment.
-     */
-    const SHODAN_API_KEY = "PASTE_YOUR_SHODAN_API_KEY_HERE";
-
-    const form = document.getElementById("lookup-form");
-    const input = document.getElementById("ip");
-    const button = document.getElementById("submit");
-    const message = document.getElementById("message");
-    const results = document.getElementById("results");
-    const overview = document.getElementById("overview");
-    const portsBox = document.getElementById("ports");
-    const servicesBox = document.getElementById("services");
-    const updated = document.getElementById("updated");
-
-    function setMessage(text, error = false) {
-      message.textContent = text;
-      message.classList.toggle("error", error);
-    }
-
-    function addCard(label, value) {
-      const card = document.createElement("div");
-      card.className = "card";
-
-      const heading = document.createElement("div");
-      heading.className = "label";
-      heading.textContent = label;
-
-      const content = document.createElement("div");
-      content.className = "value";
-      content.textContent = value || "Not available";
-
-      card.append(heading, content);
-      overview.appendChild(card);
-    }
-
-    function renderHost(host) {
-      overview.replaceChildren();
-      portsBox.replaceChildren();
-      servicesBox.replaceChildren();
-
-      addCard("IP address", host.ip_str);
-      addCard("Country", host.country_name || host.country_code);
-      addCard("City", host.city);
-      addCard("Organization", host.org);
-      addCard("ISP", host.isp);
-      addCard("ASN", host.asn);
-
-      const ports = Array.isArray(host.ports) ? host.ports : [];
-
-      if (!ports.length) {
-        portsBox.textContent = "No port information returned.";
-      } else {
-        ports.forEach((port) => {
-          const badge = document.createElement("span");
-          badge.className = "port";
-          badge.textContent = String(port);
-          portsBox.appendChild(badge);
-        });
-      }
-
-      const services = Array.isArray(host.data) ? host.data : [];
-
-      if (!services.length) {
-        servicesBox.textContent = "No service banners returned.";
-      }
-
-      services.slice(0, 100).forEach((service) => {
-        const card = document.createElement("article");
-        card.className = "service";
-
-        const heading = document.createElement("strong");
-        heading.textContent =
-          `${service.transport || "tcp"}/${service.port}` +
-          (service.product ? ` — ${service.product}` : "");
-
-        const details = document.createElement("div");
-        details.className = "muted";
-        details.textContent =
-          [service.version, service.module].filter(Boolean).join(" · ");
-
-        const banner = document.createElement("pre");
-        banner.textContent = service.data || "No banner text available.";
-
-        card.append(heading, details, banner);
-        servicesBox.appendChild(card);
-      });
-
-      updated.textContent = host.last_update
-        ? `Shodan last updated: ${host.last_update}`
-        : "No update timestamp provided.";
-
-      results.hidden = false;
-    }
-
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-
-      const ip = input.value.trim();
-
-      if (!ip) {
-        setMessage("Enter an IP address.", true);
-        return;
-      }
-
-      if (
-        !SHODAN_API_KEY ||
-        SHODAN_API_KEY === "ZpnRWfE5ZKdpfycOSjfR5P41VgmFr6Cq"
-      ) {
-        setMessage("Add your Shodan API key to test this page.", true);
-        return;
-      }
-
-      button.disabled = true;
-      results.hidden = true;
-      setMessage("Requesting host data from Shodan...");
-
-      try {
-        const endpoint =
-          "https://api.shodan.io/shodan/host/" +
-          encodeURIComponent(ip) +
-          "?key=" + encodeURIComponent(SHODAN_API_KEY);
-
-        const response = await fetch(endpoint);
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-          throw new Error(
-            data.error || `Shodan returned HTTP ${response.status}.`
-          );
-        }
-
-        renderHost(data);
-        setMessage("Lookup completed.");
-      } catch (error) {
-        setMessage(
-          error.message ||
-          "Request failed. Shodan may block direct browser requests (CORS).",
-          true
-        );
-      } finally {
-        button.disabled = false;
-      }
-    });
-  </script>
 </body>
 </html>
