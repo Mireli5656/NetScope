@@ -1,28 +1,32 @@
 
 "use strict";
 
-const CONFIG = {
-  API_URL: "https://internetdb.shodan.io/"
+const SOURCES = {
+  internetDB: "https://internetdb.shodan.io/",
+  ipapi: "https://ipapi.co/",
+  atlas: "https://atlas.ipinfo.app/api/v2/ip/"
 };
 
-const form = document.getElementById("search-form");
-const ipInput = document.getElementById("ip-input");
-const searchButton = document.getElementById("search-button");
-const buttonLabel = document.getElementById("button-label");
-const statusBox = document.getElementById("status");
-const results = document.getElementById("results");
+const $ = (id) => document.getElementById(id);
 
-const overview = document.getElementById("overview");
-const portsContainer = document.getElementById("ports");
-const bannersContainer = document.getElementById("banners");
+const form = $("search-form");
+const ipInput = $("ip-input");
+const searchButton = $("search-button");
+const buttonLabel = $("button-label");
+const statusBox = $("status");
+const results = $("results");
 
-const portCount = document.getElementById("port-count");
-const serviceCount = document.getElementById("service-count");
-const countryStat = document.getElementById("country-stat");
+const overview = $("overview");
+const portsContainer = $("ports");
+const bannersContainer = $("banners");
 
-const resultIP = document.getElementById("result-ip");
-const shodanLink = document.getElementById("shodan-link");
-const bannerCount = document.getElementById("banner-count");
+const portCount = $("port-count");
+const serviceCount = $("service-count");
+const countryStat = $("country-stat");
+
+const resultIP = $("result-ip");
+const shodanLink = $("shodan-link");
+const bannerCount = $("banner-count");
 
 let controller = null;
 
@@ -31,11 +35,6 @@ function showStatus(message, type = "") {
   statusBox.className = "status";
   if (type) statusBox.classList.add(type);
   statusBox.hidden = false;
-}
-
-function setLoading(loading) {
-  searchButton.disabled = loading;
-  buttonLabel.textContent = loading ? "Loading..." : "Analyze IP";
 }
 
 function validIPv4(ip) {
@@ -48,118 +47,150 @@ function validIPv4(ip) {
   );
 }
 
-function element(tag, className, value) {
+function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
-  if (value !== undefined && value !== null) {
-    node.textContent = String(value);
+  if (text !== undefined && text !== null) {
+    node.textContent = String(text);
   }
   return node;
 }
 
-function addInfo(label, value) {
-  const row = element("div", "info-row");
-  row.append(
-    element("span", "info-key", label),
-    element(
-      "span",
-      "info-value",
-      Array.isArray(value)
-        ? value.join(", ") || "None reported"
-        : value || "Not reported"
-    )
-  );
+function value(v) {
+  if (Array.isArray(v)) return v.length ? v.join(", ") : "None reported";
+  if (v === null || v === undefined || v === "") return "Not reported";
+  return String(v);
+}
+
+async function fetchJSON(url, signal) {
+  const response = await fetch(url, {
+    headers: { Accept: "application/json" },
+    signal
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function optionalJSON(url, signal) {
+  try {
+    return await fetchJSON(url, signal);
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    return { _sourceError: error.message };
+  }
+}
+
+function addInfo(label, val, source = "") {
+  const row = el("div", "info-row");
+  const key = el("span", "info-key", label);
+  const content = el("span", "info-value", value(val));
+
+  if (source) content.title = `Source: ${source}`;
+
+  row.append(key, content);
   overview.appendChild(row);
 }
 
-function renderOverview(data, ip) {
+function renderOverview(ip, db, geo, atlas) {
   overview.replaceChildren();
 
-  addInfo("IP address", data.ip || ip);
-  addInfo("Hostnames", data.hostnames);
-  addInfo("Tags", data.tags);
-  addInfo("CPEs", data.cpes);
-  addInfo("Known CVEs", data.vulns);
-  addInfo("Data source", "Shodan InternetDB");
-  addInfo("Update cycle", "Weekly");
+  const atlasLocation = atlas.location || {};
+  const atlasASN = atlas.as_number
+    ? `AS${atlas.as_number}`
+    : "";
+
+  addInfo("IP address", ip, "Input");
+  addInfo("Country", geo.country_name || atlas.country, "ipapi / Atlas");
+  addInfo("Country code", geo.country || atlas.country_code, "ipapi / Atlas");
+  addInfo("City", geo.city || atlasLocation.city, "ipapi / Atlas");
+  addInfo("Region", geo.region || atlasLocation.region, "ipapi / Atlas");
+  addInfo("Coordinates",
+    geo.latitude != null && geo.longitude != null
+      ? `${geo.latitude}, ${geo.longitude}`
+      : atlasLocation.latitude != null && atlasLocation.longitude != null
+        ? `${atlasLocation.latitude}, ${atlasLocation.longitude}`
+        : null,
+    "ipapi / Atlas"
+  );
+  addInfo("ASN", geo.asn || atlasASN, "ipapi / Atlas");
+  addInfo("Organization / ISP", geo.org || atlas.as_description, "ipapi / Atlas");
+  addInfo("BGP prefix", atlas.cidr, "Atlas");
+  addInfo("Timezone", geo.timezone, "ipapi");
+  addInfo("Hostnames", db.hostnames, "Shodan InternetDB");
+  addInfo("Tags", db.tags, "Shodan InternetDB");
+  addInfo("CPEs", db.cpes, "Shodan InternetDB");
+  addInfo("Known CVEs", db.vulns, "Shodan InternetDB");
 }
 
-function renderPorts(data) {
+function renderPorts(db) {
   portsContainer.replaceChildren();
 
-  const ports = Array.isArray(data.ports)
-    ? [...new Set(data.ports)].sort((a, b) => a - b)
+  const ports = Array.isArray(db.ports)
+    ? [...new Set(db.ports)].sort((a, b) => a - b)
     : [];
 
   portCount.textContent = String(ports.length);
 
   if (!ports.length) {
     portsContainer.appendChild(
-      element("div", "empty-state", "No ports reported.")
+      el("div", "empty-state", "No ports reported by InternetDB.")
     );
     return;
   }
 
   ports.forEach(port => {
-    portsContainer.appendChild(
-      element("span", "port-chip", port)
-    );
+    portsContainer.appendChild(el("span", "port-chip", port));
   });
 }
 
-function renderBanners(data) {
+function renderRecords(db) {
   bannersContainer.replaceChildren();
 
-  // InternetDB does not provide full service banners.
-  // Display its available CPE, tag and vulnerability records instead.
   const groups = [
-    ["Known vulnerabilities", data.vulns],
-    ["Detected technologies (CPE)", data.cpes],
-    ["Tags", data.tags],
-    ["Hostnames", data.hostnames]
+    ["Known vulnerabilities (CVE)", db.vulns],
+    ["Detected technologies (CPE)", db.cpes],
+    ["Tags", db.tags],
+    ["Hostnames", db.hostnames]
   ];
 
-  const entries = groups.flatMap(([name, values]) =>
-    (Array.isArray(values) ? values : []).map(value => ({
-      name,
-      value
-    }))
+  const records = groups.flatMap(([title, list]) =>
+    (Array.isArray(list) ? list : []).map(item => ({ title, item }))
   );
 
-  serviceCount.textContent = String(entries.length);
+  serviceCount.textContent = String(records.length);
   bannerCount.textContent =
-    `${entries.length} ${entries.length === 1 ? "record" : "records"}`;
+    `${records.length} ${records.length === 1 ? "record" : "records"}`;
 
-  if (!entries.length) {
+  if (!records.length) {
     bannersContainer.appendChild(
-      element(
-        "div",
-        "empty-state",
-        "No additional records were reported by InternetDB."
-      )
+      el("div", "empty-state", "No additional records reported.")
     );
     return;
   }
 
-  entries.forEach((entry, index) => {
-    const card = element("article", "banner-card");
-    const heading = element("div", "banner-heading");
+  records.forEach((record, index) => {
+    const card = el("article", "banner-card");
+    const heading = el("div", "banner-heading");
 
     heading.append(
-      element("span", "", entry.name),
-      element("span", "", `#${index + 1}`)
+      el("span", "", record.title),
+      el("span", "", `#${index + 1}`)
     );
 
     card.append(
       heading,
-      element("pre", "banner-body", entry.value)
+      el("pre", "banner-body", record.item)
     );
 
     bannersContainer.appendChild(card);
   });
 }
 
-async function lookupIP(ip) {
+async function lookup(ip) {
   if (!validIPv4(ip)) {
     showStatus("Enter a valid IPv4 address, e.g. 8.8.8.8.", "error");
     ipInput.focus();
@@ -167,78 +198,84 @@ async function lookupIP(ip) {
   }
 
   if (controller) controller.abort();
+
   controller = new AbortController();
+  const current = controller;
+  const timeout = setTimeout(() => current.abort(), 20000);
 
-  const currentController = controller;
-  const timeout = setTimeout(
-    () => currentController.abort(),
-    20000
-  );
-
-  setLoading(true);
+  searchButton.disabled = true;
+  buttonLabel.textContent = "Analyzing...";
   results.hidden = true;
-  showStatus(`Looking up ${ip} in Shodan InternetDB...`);
+  showStatus("Collecting data from InternetDB, ipapi.co and Atlas...");
+
+  const encodedIP = encodeURIComponent(ip);
 
   try {
-    const response = await fetch(
-      CONFIG.API_URL + encodeURIComponent(ip),
-      {
-        method: "GET",
-        headers: { Accept: "application/json" },
-        signal: currentController.signal
-      }
-    );
+    const [dbResult, geoResult, atlasResult] = await Promise.all([
+      optionalJSON(SOURCES.internetDB + encodedIP, current.signal),
+      optionalJSON(SOURCES.ipapi + encodedIP + "/json/", current.signal),
+      optionalJSON(SOURCES.atlas + encodedIP, current.signal)
+    ]);
 
-    if (response.status === 404) {
+    if (dbResult._sourceError &&
+        geoResult._sourceError &&
+        atlasResult._sourceError) {
       throw new Error(
-        "No InternetDB record was found for this IP address."
+        "All sources failed. Check your internet connection or API availability."
       );
     }
 
-    if (!response.ok) {
-      throw new Error(`InternetDB returned HTTP ${response.status}.`);
-    }
-
-    const data = await response.json();
+    const db = dbResult._sourceError ? {} : dbResult;
+    const geo = geoResult._sourceError ? {} : geoResult;
+    const atlas = atlasResult._sourceError ? {} : atlasResult;
 
     results.hidden = false;
-    resultIP.textContent = data.ip || ip;
+    resultIP.textContent = ip;
     shodanLink.href =
-      "https://www.shodan.io/host/" + encodeURIComponent(ip);
+      "https://www.shodan.io/host/" + encodedIP;
 
-    countryStat.textContent = "N/A";
-    renderOverview(data, ip);
-    renderPorts(data);
-    renderBanners(data);
+    countryStat.textContent =
+      geo.country_name || atlas.country || "N/A";
 
-    showStatus("InternetDB lookup completed.", "success");
+    renderOverview(ip, db, geo, atlas);
+    renderPorts(db);
+    renderRecords(db);
 
-    results.scrollIntoView({
-      behavior: "smooth",
-      block: "start"
-    });
-  } catch (error) {
-    if (error.name === "AbortError") {
-      showStatus("Request timed out or was cancelled.", "error");
-    } else if (error instanceof TypeError) {
+    const successful = [
+      !dbResult._sourceError,
+      !geoResult._sourceError,
+      !atlasResult._sourceError
+    ].filter(Boolean).length;
+
+    if (successful === 3) {
+      showStatus("Lookup completed. All three sources responded.", "success");
+    } else {
       showStatus(
-        "Could not reach InternetDB. Check your connection and try again.",
+        `Lookup completed with partial data (${successful}/3 sources). Some providers may have blocked the request or be temporarily unavailable.`,
         "error"
       );
-    } else {
-      showStatus(error.message || "Lookup failed.", "error");
     }
+
+    results.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    showStatus(
+      error.name === "AbortError"
+        ? "Request timed out. Please try again."
+        : error.message || "Lookup failed.",
+      "error"
+    );
   } finally {
     clearTimeout(timeout);
 
-    if (controller === currentController) {
+    if (controller === current) {
       controller = null;
-      setLoading(false);
+      searchButton.disabled = false;
+      buttonLabel.textContent = "Analyze IP";
     }
   }
 }
 
 form.addEventListener("submit", event => {
   event.preventDefault();
-  lookupIP(ipInput.value.trim());
+  lookup(ipInput.value.trim());
 });
