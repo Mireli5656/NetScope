@@ -1,18 +1,19 @@
 "use strict";
 
+/*
+ * NetScope — passive public-IP intelligence
+ * Sources: Shodan InternetDB, ipapi.co, Atlas IPinfo and Shodan CVEDB.
+ * No port scan is performed. Product/CPE matches are potential matches only.
+ */
+
 const SOURCES = {
   internetDB: "https://internetdb.shodan.io/",
   ipapi: "https://ipapi.co/",
   atlas: "https://atlas.ipinfo.app/api/v2/ip/"
 };
 
-const NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0";
-const NVD_WINDOW_MS = 30_000;
-const NVD_REQUEST_BUDGET = 4;
-const NVD_CACHE = new Map();
-let nvdRequestTimes = [];
-
-const $ = (id) => document.getElementById(id);
+const CVEDB_API = "https://cvedb.shodan.io";
+const $ = id => document.getElementById(id);
 
 const form = $("search-form");
 const ipInput = $("ip-input");
@@ -23,27 +24,42 @@ const results = $("results");
 const overview = $("overview");
 const portsContainer = $("ports");
 const bannersContainer = $("banners");
-
 const portCount = $("port-count");
 const serviceCount = $("service-count");
 const countryStat = $("country-stat");
-
 const resultIP = $("result-ip");
 const shodanLink = $("shodan-link");
 const bannerCount = $("banner-count");
 
-let controller = null;
+let activeController = null;
 let securityPanel = null;
 
+const cveCache = new Map();
+const cpeCache = new Map();
+
+let kevCache = null;
+let kevCacheTime = 0;
+
+const CACHE_TTL = 30 * 60 * 1000;
+const MAX_DIRECT_CVES = 8;
+const MAX_CPE_QUERIES = 5;
+const MAX_PRODUCT_CVES = 20;
+const MAX_KEV_CVES = 8;
+
 function showStatus(message, type = "") {
+  if (!statusBox) return;
+
   statusBox.textContent = message;
   statusBox.className = "status";
+
   if (type) statusBox.classList.add(type);
+
   statusBox.hidden = false;
 }
 
 function validIPv4(ip) {
-  const parts = ip.split(".");
+  const parts = String(ip).split(".");
+
   return parts.length === 4 && parts.every(part =>
     /^\d{1,3}$/.test(part) &&
     !(part.length > 1 && part.startsWith("0")) &&
@@ -59,21 +75,17 @@ function ipv4ToNumber(ip) {
   );
 }
 
-function inIPv4Range(ipNumber, network, prefix) {
-  const networkNumber = ipv4ToNumber(network);
-  const blockSize = 2 ** (32 - prefix);
+function inIPv4Range(number, network, prefix) {
+  const start = ipv4ToNumber(network);
+  const size = 2 ** (32 - prefix);
 
-  return (
-    Math.floor(ipNumber / blockSize) ===
-    Math.floor(networkNumber / blockSize)
-  );
+  return Math.floor(number / size) ===
+    Math.floor(start / size);
 }
 
 function isPublicIPv4(ip) {
   if (!validIPv4(ip)) return false;
 
-  // Do not send private or special-use IP addresses
-  // to third-party public intelligence providers.
   const specialRanges = [
     ["0.0.0.0", 8],
     ["10.0.0.0", 8],
@@ -99,7 +111,7 @@ function isPublicIPv4(ip) {
   );
 }
 
-function el(tag, className, text) {
+function el(tag, className = "", text) {
   const node = document.createElement(tag);
 
   if (className) node.className = className;
@@ -111,24 +123,26 @@ function el(tag, className, text) {
   return node;
 }
 
-function value(v) {
-  if (Array.isArray(v)) {
-    return v.length ? v.join(", ") : "None reported";
+function displayValue(item) {
+  if (Array.isArray(item)) {
+    return item.length ? item.join(", ") : "None reported";
   }
 
-  if (v === null || v === undefined || v === "") {
+  if (item === null || item === undefined || item === "") {
     return "Not reported";
   }
 
-  return String(v);
+  return String(item);
 }
 
 async function fetchJSON(url, signal) {
   const response = await fetch(url, {
+    method: "GET",
     headers: {
       Accept: "application/json"
     },
-    signal
+    signal,
+    cache: "no-store"
   });
 
   if (!response.ok) {
@@ -142,10 +156,14 @@ async function optionalJSON(url, signal) {
   try {
     return await fetchJSON(url, signal);
   } catch (error) {
-    if (error.name === "AbortError") throw error;
+    if (error && error.name === "AbortError") {
+      throw error;
+    }
 
     return {
-      _sourceError: error.message || "Request failed"
+      _sourceError: error && error.message
+        ? error.message
+        : "Request failed"
     };
   }
 }
@@ -153,7 +171,7 @@ async function optionalJSON(url, signal) {
 function addInfo(label, val, source = "") {
   const row = el("div", "info-row");
   const key = el("span", "info-key", label);
-  const content = el("span", "info-value", value(val));
+  const content = el("span", "info-value", displayValue(val));
 
   if (source) {
     content.title = `Source: ${source}`;
@@ -163,76 +181,61 @@ function addInfo(label, val, source = "") {
   overview.appendChild(row);
 }
 
+function getCveIds(rawVulns) {
+  if (!Array.isArray(rawVulns)) return [];
+
+  const ids = rawVulns.map(item => {
+    if (typeof item === "string") {
+      return item.trim().toUpperCase();
+    }
+
+    if (item && typeof item === "object") {
+      return String(
+        item.cve || item.id || item.cve_id || ""
+      ).trim().toUpperCase();
+    }
+
+    return "";
+  }).filter(id => /^CVE-\d{4}-\d{4,}$/.test(id));
+
+  return [...new Set(ids)];
+}
+
 function renderOverview(ip, db, geo, atlas) {
   overview.replaceChildren();
 
-  const atlasLocation = atlas.location || {};
-  const atlasASN = atlas.as_number
+  const location = atlas.location || {};
+  const asn = atlas.as_number
     ? `AS${atlas.as_number}`
     : "";
 
-  const cveCount = Array.isArray(db.vulns)
-    ? getCveIds(db.vulns).length
-    : 0;
-
-  addInfo("IP address", ip, "Input");
-
-  addInfo(
-    "Country",
-    geo.country_name || atlas.country,
-    "ipapi / Atlas"
-  );
-
-  addInfo(
-    "Country code",
-    geo.country || atlas.country_code,
-    "ipapi / Atlas"
-  );
-
-  addInfo(
-    "City",
-    geo.city || atlasLocation.city,
-    "ipapi / Atlas"
-  );
-
-  addInfo(
-    "Region",
-    geo.region || atlasLocation.region,
-    "ipapi / Atlas"
-  );
-
-  addInfo(
-    "Coordinates",
+  const coordinates =
     geo.latitude != null && geo.longitude != null
       ? `${geo.latitude}, ${geo.longitude}`
-      : atlasLocation.latitude != null &&
-        atlasLocation.longitude != null
-        ? `${atlasLocation.latitude}, ${atlasLocation.longitude}`
-        : null,
-    "ipapi / Atlas"
-  );
+      : location.latitude != null && location.longitude != null
+        ? `${location.latitude}, ${location.longitude}`
+        : null;
 
-  addInfo(
-    "ASN",
-    geo.asn || atlasASN,
-    "ipapi / Atlas"
-  );
-
+  addInfo("IP address", ip, "Input");
+  addInfo("Country", geo.country_name || atlas.country, "ipapi / Atlas");
+  addInfo("Country code", geo.country || atlas.country_code, "ipapi / Atlas");
+  addInfo("City", geo.city || location.city, "ipapi / Atlas");
+  addInfo("Region", geo.region || location.region, "ipapi / Atlas");
+  addInfo("Coordinates", coordinates, "ipapi / Atlas");
+  addInfo("ASN", geo.asn || asn, "ipapi / Atlas");
   addInfo(
     "Organization / ISP",
     geo.org || atlas.as_description,
     "ipapi / Atlas"
   );
-
   addInfo("BGP prefix", atlas.cidr, "Atlas");
   addInfo("Timezone", geo.timezone, "ipapi");
   addInfo("Hostnames", db.hostnames, "Shodan InternetDB");
   addInfo("Tags", db.tags, "Shodan InternetDB");
   addInfo("CPEs", db.cpes, "Shodan InternetDB");
-
   addInfo(
-    "Known CVEs reported",
-    cveCount,
+    "Host CVEs reported",
+    getCveIds(db.vulns).length,
     "Shodan InternetDB"
   );
 }
@@ -262,13 +265,8 @@ function renderPorts(db) {
 
   if (!ports.length) {
     portsContainer.appendChild(
-      el(
-        "div",
-        "empty-state",
-        "No ports reported by InternetDB."
-      )
+      el("div", "empty-state", "No ports reported by InternetDB.")
     );
-
     return;
   }
 
@@ -289,10 +287,8 @@ function renderRecords(db) {
   ];
 
   const records = groups.flatMap(([title, list]) =>
-    (Array.isArray(list) ? list : []).map(item => ({
-      title,
-      item
-    }))
+    (Array.isArray(list) ? list : [])
+      .map(item => ({ title, item }))
   );
 
   serviceCount.textContent = String(records.length);
@@ -302,13 +298,8 @@ function renderRecords(db) {
 
   if (!records.length) {
     bannersContainer.appendChild(
-      el(
-        "div",
-        "empty-state",
-        "No additional records reported."
-      )
+      el("div", "empty-state", "No additional records reported.")
     );
-
     return;
   }
 
@@ -330,272 +321,142 @@ function renderRecords(db) {
   });
 }
 
-function getCveIds(rawVulns) {
-  if (!Array.isArray(rawVulns)) return [];
+function normalizeCpe23(raw) {
+  if (typeof raw !== "string") return null;
 
-  const ids = rawVulns
-    .map(item => {
-      if (typeof item === "string") {
-        return item.trim().toUpperCase();
-      }
+  const cpe = raw.trim();
 
-      if (item && typeof item === "object") {
-        return String(
-          item.cve || item.id || item.cve_id || ""
-        ).trim().toUpperCase();
-      }
+  if (cpe.startsWith("cpe:2.3:")) {
+    const parts = cpe.split(":");
 
-      return "";
-    })
-    .filter(id => /^CVE-\d{4}-\d{4,}$/.test(id));
-
-  return [...new Set(ids)];
-}
-
-function normalizeSeverity(severity, score, version) {
-  const supplied = String(severity || "")
-    .trim()
-    .toLowerCase();
-
-  if (
-    ["critical", "high", "medium", "low", "none"]
-      .includes(supplied)
-  ) {
-    return supplied.charAt(0).toUpperCase() +
-      supplied.slice(1);
-  }
-
-  if (!Number.isFinite(score)) return "Unrated";
-  if (score === 0) return "None";
-
-  if (version === "2.0") {
-    if (score < 4) return "Low";
-    if (score < 7) return "Medium";
-    return "High";
-  }
-
-  if (score < 4) return "Low";
-  if (score < 7) return "Medium";
-  if (score < 9) return "High";
-
-  return "Critical";
-}
-
-function extractCvss(cve) {
-  const metrics = cve && cve.metrics
-    ? cve.metrics
-    : {};
-
-  const candidates = [
-    ["4.0", metrics.cvssMetricV40],
-    ["3.1", metrics.cvssMetricV31],
-    ["3.0", metrics.cvssMetricV30],
-    ["2.0", metrics.cvssMetricV2]
-  ];
-
-  for (const [fallbackVersion, entries] of candidates) {
-    if (!Array.isArray(entries) || !entries.length) {
-      continue;
+    if (
+      parts.length >= 5 &&
+      ["a", "h", "o"].includes(parts[2]) &&
+      parts[3] &&
+      parts[4]
+    ) {
+      return parts.slice(0, Math.min(parts.length, 13)).join(":");
     }
 
-    const metric =
-      entries.find(entry => entry.type === "Primary") ||
-      entries[0];
+    return null;
+  }
 
-    const data = metric && metric.cvssData
-      ? metric.cvssData
-      : {};
+  // Convert older InternetDB identifiers such as:
+  // cpe:/a:apache:http_server:2.4.49
+  if (cpe.startsWith("cpe:/")) {
+    const parts = cpe.slice(5).split(":");
 
-    const score = Number(data.baseScore);
+    const part = parts[0];
+    const vendor = parts[1];
+    const product = parts[2];
+    const version = parts[3] || "*";
 
-    if (Number.isFinite(score)) {
-      const version = String(
-        data.version || fallbackVersion
-      );
-
-      return {
-        version,
-        score,
-        severity: normalizeSeverity(
-          data.baseSeverity || metric.baseSeverity,
-          score,
-          version
-        ),
-        vector: data.vectorString || ""
-      };
+    if (
+      !["a", "h", "o"].includes(part) ||
+      !vendor ||
+      !product
+    ) {
+      return null;
     }
+
+    const values = [
+      part,
+      vendor,
+      product,
+      version,
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*"
+    ];
+
+    return `cpe:2.3:${values.join(":")}`;
   }
 
   return null;
 }
 
-function parseCveResponse(id, payload) {
-  const entry = Array.isArray(payload.vulnerabilities)
-    ? payload.vulnerabilities[0]
-    : null;
+function recordId(record) {
+  const id = String(
+    record && (record.cve_id || record.id || record.cve) || ""
+  ).toUpperCase();
 
-  if (!entry || !entry.cve) {
-    return {
-      id,
-      found: false,
-      notFound: true
-    };
-  }
-
-  const cve = entry.cve;
-
-  const descriptions = Array.isArray(cve.descriptions)
-    ? cve.descriptions
-    : [];
-
-  const description =
-    descriptions.find(
-      item => item.lang === "en" && item.value
-    ) ||
-    descriptions.find(item => item.value) ||
-    null;
-
-  const weaknesses = Array.isArray(cve.weaknesses)
-    ? [
-        ...new Set(
-          cve.weaknesses.flatMap(item =>
-            (
-              Array.isArray(item.description)
-                ? item.description
-                : []
-            )
-              .map(desc => desc.value)
-              .filter(value => /^CWE-\d+$/i.test(value || ""))
-          )
-        )
-      ]
-    : [];
-
-  const references = Array.isArray(cve.references)
-    ? cve.references
-        .map(item => ({
-          url: item.url,
-          tags: Array.isArray(item.tags)
-            ? item.tags
-            : []
-        }))
-        .filter(item =>
-          typeof item.url === "string" &&
-          /^https?:\/\//i.test(item.url)
-        )
-        .slice(0, 3)
-    : [];
-
-  return {
-    id,
-    found: true,
-    status: cve.vulnStatus || "Not reported",
-    description: description
-      ? description.value
-      : "No description was supplied by NVD.",
-    published: cve.published || "",
-    lastModified: cve.lastModified || "",
-    sourceIdentifier: cve.sourceIdentifier || "",
-    cvss: extractCvss(cve),
-    weaknesses,
-    references
-  };
+  return /^CVE-\d{4}-\d{4,}$/.test(id) ? id : "";
 }
 
-function userFriendlyNvdError(error) {
-  const message = String(
-    error && error.message
-      ? error.message
-      : ""
-  );
-
-  if (/HTTP 403|HTTP 429/i.test(message)) {
-    return "NVD temporarily refused the request or rate-limited it. Try again later.";
-  }
-
-  if (/HTTP 5\d\d/i.test(message)) {
-    return "NVD is temporarily unavailable.";
-  }
-
-  if (error && error.name === "AbortError") {
-    return "NVD lookup timed out; this CVE was not assessed in this pass.";
-  }
-
-  return "NVD could not be reached from this browser. Check connectivity or CORS availability.";
+function cveUrl(id) {
+  return `https://nvd.nist.gov/vuln/detail/${encodeURIComponent(id)}`;
 }
 
-async function fetchCveDetails(id, signal) {
+function severityFromScore(score) {
+  if (
+    score === null ||
+    score === undefined ||
+    score === "" ||
+    !Number.isFinite(Number(score))
+  ) {
+    return "Unrated";
+  }
+
+  const number = Number(score);
+
+  if (number >= 9) return "Critical";
+  if (number >= 7) return "High";
+  if (number >= 4) return "Medium";
+  if (number > 0) return "Low";
+
+  return "None";
+}
+
+function severityClass(severity) {
+  const value = String(severity || "").toLowerCase();
+
+  if (value === "critical") return "risk-badge risk-critical";
+  if (value === "high") return "risk-badge risk-high";
+  if (value === "medium") return "risk-badge risk-medium";
+  if (value === "low") return "risk-badge risk-low";
+
+  return "risk-badge risk-unknown";
+}
+
+function safeExternalLink(url, label) {
   try {
-    const url =
-      `${NVD_API}?cveId=${encodeURIComponent(id)}`;
+    const parsed = new URL(url);
 
-    const payload = await fetchJSON(url, signal);
-    const parsed = parseCveResponse(id, payload);
+    if (
+      parsed.protocol !== "https:" &&
+      parsed.protocol !== "http:"
+    ) {
+      return null;
+    }
 
-    NVD_CACHE.set(id, parsed);
+    const link = el("a", "", label || parsed.hostname);
 
-    return parsed;
-  } catch (error) {
-    return {
-      id,
-      found: false,
-      lookupError: userFriendlyNvdError(error)
-    };
+    link.href = parsed.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+
+    return link;
+  } catch (_error) {
+    return null;
   }
 }
 
-async function enrichCveIds(ids, signal) {
-  const now = Date.now();
+function formatDate(input) {
+  if (!input) return "Not reported";
 
-  nvdRequestTimes = nvdRequestTimes.filter(
-    timestamp => now - timestamp < NVD_WINDOW_MS
-  );
+  const date = new Date(input);
 
-  const missing = ids.filter(
-    id => !NVD_CACHE.has(id)
-  );
-
-  const availableBudget = Math.max(
-    0,
-    NVD_REQUEST_BUDGET - nvdRequestTimes.length
-  );
-
-  const selected = missing.slice(0, availableBudget);
-
-  // Keep this tab's requests under a conservative rolling budget.
-  selected.forEach(() => {
-    nvdRequestTimes.push(Date.now());
-  });
-
-  const fetched = await Promise.all(
-    selected.map(id => fetchCveDetails(id, signal))
-  );
-
-  const fetchedById = new Map(
-    fetched.map(detail => [detail.id, detail])
-  );
-
-  return ids.map(id => {
-    if (NVD_CACHE.has(id)) {
-      return NVD_CACHE.get(id);
-    }
-
-    if (fetchedById.has(id)) {
-      return fetchedById.get(id);
-    }
-
-    return {
-      id,
-      found: false,
-      notQueried: true
-    };
-  });
+  return Number.isNaN(date.getTime())
+    ? String(input)
+    : date.toISOString().slice(0, 10);
 }
 
 function injectSecurityStyles() {
-  if (document.getElementById("netscope-security-styles")) {
-    return;
-  }
+  if ($("netscope-security-styles")) return;
 
   const style = el("style");
   style.id = "netscope-security-styles";
@@ -652,6 +513,7 @@ function injectSecurityStyles() {
       border-radius: 11px;
       color: var(--muted, #8c9ab2);
       font-size: 13px;
+      line-height: 1.55;
     }
 
     .security-subheading {
@@ -755,19 +617,33 @@ function injectSecurityStyles() {
       overflow-wrap: anywhere;
     }
 
+    .security-empty {
+      padding: 13px;
+      border: 1px dashed var(--border, #243047);
+      border-radius: 10px;
+      color: var(--muted, #8c9ab2);
+      font-size: 13px;
+    }
+
+    .intel-label {
+      display: inline-flex;
+      align-items: center;
+      margin: 0 0 10px;
+      padding: 4px 8px;
+      border: 1px solid var(--border, #243047);
+      border-radius: 6px;
+      color: var(--muted, #8c9ab2);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: .5px;
+      text-transform: uppercase;
+    }
+
     .port-warning-list {
       display: grid;
       gap: 8px;
       margin: 10px 0 0;
       padding-left: 20px;
-      color: var(--muted, #8c9ab2);
-      font-size: 13px;
-    }
-
-    .security-empty {
-      padding: 13px;
-      border: 1px dashed var(--border, #243047);
-      border-radius: 10px;
       color: var(--muted, #8c9ab2);
       font-size: 13px;
     }
@@ -778,10 +654,7 @@ function injectSecurityStyles() {
         gap: 9px;
       }
 
-      .security-metric {
-        padding: 12px;
-      }
-
+      .security-metric,
       .cve-card {
         padding: 12px;
       }
@@ -798,46 +671,71 @@ function ensureSecurityPanel() {
 
   securityPanel = el("section", "panel security-panel");
   securityPanel.id = "security-analysis";
+
   securityPanel.setAttribute(
     "aria-labelledby",
     "security-analysis-title"
   );
 
   const heading = el("div", "panel-heading");
-  const headingText = el("div");
+  const titleWrap = el("div");
 
-  headingText.append(
-    el("h3", "", "Vulnerability intelligence"),
+  const title = el("h3", "", "Vulnerability intelligence");
+  title.id = "security-analysis-title";
+
+  titleWrap.append(
+    title,
     el(
       "p",
       "panel-description",
-      "Passive analysis based on public InternetDB and NVD records. No port scan is performed."
+      "Passive analysis using public InternetDB and Shodan CVEDB records. No port scan is performed."
     )
   );
 
-  const badge = el("span", "count-badge", "CVE analysis");
-
-  heading.append(headingText, badge);
-
-  headingText.querySelector("h3").id =
-    "security-analysis-title";
+  const badge = el("span", "count-badge", "CVE intelligence");
+  heading.append(titleWrap, badge);
 
   const summary = el("div", "security-summary");
   summary.id = "security-summary";
 
-  const riskNote = el("div", "security-note");
-  riskNote.id = "security-risk-note";
+  const note = el("div", "security-note");
+  note.id = "security-risk-note";
 
-  const cveHeading = el(
+  const hostTitle = el("h4", "security-subheading", "Host CVEs");
+  const hostList = el("div", "cve-list");
+  hostList.id = "host-cve-list";
+
+  const productTitle = el(
     "h4",
     "security-subheading",
-    "CVE details"
+    "Potential product/CPE CVE matches"
   );
 
-  const cveList = el("div", "cve-list");
-  cveList.id = "cve-list";
+  const productNote = el(
+    "p",
+    "security-note",
+    "These CVEs are associated with product identifiers reported by InternetDB. They are possible matches only, not proof that this host is affected."
+  );
 
-  const portHeading = el(
+  const productList = el("div", "cve-list");
+  productList.id = "product-cve-list";
+
+  const kevTitle = el(
+    "h4",
+    "security-subheading",
+    "Global Known Exploited Vulnerabilities (KEV)"
+  );
+
+  const kevNote = el(
+    "p",
+    "security-note",
+    "This is a global threat-intelligence sample, not a list of vulnerabilities detected on the searched IP. It is not included in host-risk indicators."
+  );
+
+  const kevList = el("div", "cve-list");
+  kevList.id = "global-kev-list";
+
+  const portTitle = el(
     "h4",
     "security-subheading",
     "Port exposure indicators"
@@ -854,10 +752,16 @@ function ensureSecurityPanel() {
   securityPanel.append(
     heading,
     summary,
-    riskNote,
-    cveHeading,
-    cveList,
-    portHeading,
+    note,
+    hostTitle,
+    hostList,
+    productTitle,
+    productNote,
+    productList,
+    kevTitle,
+    kevNote,
+    kevList,
+    portTitle,
     portList
   );
 
@@ -884,73 +788,13 @@ function makeMetric(label, metricValue, note) {
   return card;
 }
 
-function severityClass(severity) {
-  const key = String(severity || "").toLowerCase();
+function renderCveCard(record, mode) {
+  const id = recordId(record) ||
+    String(record && record.id || "Unknown CVE");
 
-  if (key === "critical") {
-    return "risk-badge risk-critical";
-  }
-
-  if (key === "high") {
-    return "risk-badge risk-high";
-  }
-
-  if (key === "medium") {
-    return "risk-badge risk-medium";
-  }
-
-  if (key === "low") {
-    return "risk-badge risk-low";
-  }
-
-  return "risk-badge risk-unknown";
-}
-
-function formattedDate(input) {
-  if (!input) return "Not reported";
-
-  const date = new Date(input);
-
-  return Number.isNaN(date.getTime())
-    ? input
-    : date.toISOString().slice(0, 10);
-}
-
-function safeExternalLink(url, label) {
-  try {
-    const parsed = new URL(url);
-
-    if (
-      parsed.protocol !== "https:" &&
-      parsed.protocol !== "http:"
-    ) {
-      return null;
-    }
-
-    const link = el(
-      "a",
-      "",
-      label || parsed.hostname
-    );
-
-    link.href = parsed.href;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-
-    return link;
-  } catch (_error) {
-    return null;
-  }
-}
-
-function renderCveCard(id, detail) {
   const card = el("article", "cve-card");
   const header = el("div", "cve-card-header");
-
-  const link = safeExternalLink(
-    `https://nvd.nist.gov/vuln/detail/${encodeURIComponent(id)}`,
-    id
-  );
+  const link = safeExternalLink(cveUrl(id), id);
 
   if (link) {
     link.className = "cve-link";
@@ -959,155 +803,137 @@ function renderCveCard(id, detail) {
     header.appendChild(el("strong", "", id));
   }
 
-  let badgeText = "Not enriched";
-  let badgeClass = severityClass("unknown");
+  const score =
+    record &&
+    record.cvss !== null &&
+    record.cvss !== undefined
+      ? Number(record.cvss)
+      : NaN;
 
-  if (
-    detail &&
-    detail.found &&
-    String(detail.status || "").toLowerCase() === "rejected"
-  ) {
-    badgeText = "Rejected by NVD";
-  } else if (detail && detail.found && detail.cvss) {
-    badgeText =
-      `${detail.cvss.severity} · ${detail.cvss.score.toFixed(1)}`;
+  const severity = Number.isFinite(score)
+    ? severityFromScore(score)
+    : "Unrated";
 
-    badgeClass = severityClass(detail.cvss.severity);
-  } else if (detail && detail.found) {
-    badgeText = "No CVSS score";
-  } else if (detail && detail.notFound) {
-    badgeText = "Not found in NVD";
-  } else if (detail && detail.lookupError) {
-    badgeText = "Lookup unavailable";
+  let badgeText = Number.isFinite(score)
+    ? `${severity} · ${score.toFixed(1)}`
+    : severity;
+
+  if (record && record.kev) {
+    badgeText += " · KEV";
   }
 
   header.appendChild(
-    el("span", badgeClass, badgeText)
+    el("span", severityClass(severity), badgeText)
   );
 
   card.appendChild(header);
 
-  if (detail && detail.found) {
+  if (mode === "direct") {
     card.appendChild(
-      el("p", "cve-description", detail.description)
+      el("span", "intel-label", "Reported by InternetDB for this IP")
     );
+  }
 
-    const meta = el("div", "cve-meta");
+  if (mode === "product") {
+    card.appendChild(
+      el(
+        "span",
+        "intel-label",
+        "Potential CPE/product match — not confirmed"
+      )
+    );
+  }
 
+  if (mode === "kev") {
+    card.appendChild(
+      el(
+        "span",
+        "intel-label",
+        "Global KEV feed — not IP-specific"
+      )
+    );
+  }
+
+  const summary = record && (record.summary || record.description);
+
+  card.appendChild(
+    el(
+      "p",
+      "cve-description",
+      summary || "No summary was returned by CVEDB."
+    )
+  );
+
+  const meta = el("div", "cve-meta");
+
+  if (Number.isFinite(score)) {
     meta.appendChild(
       el(
         "span",
         "",
-        `Status: ${detail.status || "Not reported"}`
+        `CVSS v${record.cvss_version || "?"}: ${score.toFixed(1)}`
       )
     );
+  }
 
-    if (detail.cvss) {
-      meta.appendChild(
-        el(
-          "span",
-          "",
-          `CVSS v${detail.cvss.version}: ${detail.cvss.score.toFixed(1)}`
-        )
-      );
-    }
-
+  if (
+    record &&
+    record.epss !== null &&
+    record.epss !== undefined &&
+    Number.isFinite(Number(record.epss))
+  ) {
     meta.appendChild(
       el(
         "span",
         "",
-        `Published: ${formattedDate(detail.published)}`
+        `EPSS: ${(Number(record.epss) * 100).toFixed(1)}%`
       )
     );
+  }
 
+  if (record && record.published_time) {
     meta.appendChild(
-      el(
-        "span",
-        "",
-        `Modified: ${formattedDate(detail.lastModified)}`
-      )
+      el("span", "", `Published: ${formatDate(record.published_time)}`)
     );
+  }
 
-    if (detail.weaknesses && detail.weaknesses.length) {
-      meta.appendChild(
-        el(
-          "span",
-          "",
-          `Weaknesses: ${detail.weaknesses.join(", ")}`
-        )
-      );
+  if (record && record.vendor) {
+    meta.appendChild(el("span", "", `Vendor: ${record.vendor}`));
+  }
+
+  if (record && record.product) {
+    meta.appendChild(el("span", "", `Product: ${record.product}`));
+  }
+
+  card.appendChild(meta);
+
+  if (record && Array.isArray(record.references) && record.references.length) {
+    const refs = el("div", "cve-reference-list");
+
+    record.references.slice(0, 3).forEach((url, index) => {
+      const refLink = safeExternalLink(url, `Reference ${index + 1} ↗`);
+
+      if (refLink) refs.appendChild(refLink);
+    });
+
+    if (refs.childNodes.length) {
+      card.appendChild(refs);
     }
-
-    card.appendChild(meta);
-
-    if (detail.references && detail.references.length) {
-      const references = el("div", "cve-reference-list");
-
-      detail.references.forEach(reference => {
-        const refLink = safeExternalLink(
-          reference.url,
-          "Reference ↗"
-        );
-
-        if (refLink) references.appendChild(refLink);
-      });
-
-      if (references.childNodes.length) {
-        card.appendChild(references);
-      }
-    }
-
-    if (
-      detail.status &&
-      String(detail.status).toLowerCase() === "rejected"
-    ) {
-      card.appendChild(
-        el(
-          "p",
-          "security-note",
-          "NVD marks this CVE as rejected. It is not counted toward the observed CVSS summary."
-        )
-      );
-    }
-  } else if (detail && detail.notFound) {
-    card.appendChild(
-      el(
-        "p",
-        "cve-description",
-        "NVD returned no matching CVE record. This does not establish whether the host is vulnerable."
-      )
-    );
-  } else if (detail && detail.lookupError) {
-    card.appendChild(
-      el(
-        "p",
-        "cve-description",
-        detail.lookupError
-      )
-    );
-  } else {
-    card.appendChild(
-      el(
-        "p",
-        "cve-description",
-        "Not enriched in this pass. The public NVD request budget may have been reached; the CVE can still be opened on NVD using the link above."
-      )
-    );
   }
 
   return card;
 }
 
 const PORT_ADVISORIES = {
-  21: "FTP is reported. Confirm whether it permits clear-text authentication and restrict access where possible.",
-  23: "Telnet is reported. Telnet is unencrypted; prefer SSH and restrict network access.",
-  445: "SMB is reported. Restrict it to trusted networks and keep the service patched.",
+  21: "FTP is reported. Check for clear-text authentication and restrict network access.",
+  23: "Telnet is reported. It is unencrypted; prefer SSH and restrict access.",
+  445: "SMB is reported. Restrict it to trusted networks and keep it patched.",
   3389: "Remote Desktop (RDP) is reported. Restrict exposure and use strong authentication, ideally with MFA.",
-  5900: "VNC is reported. Restrict access and verify encryption and authentication settings.",
-  2375: "A Docker API port is reported. Verify that remote access is authenticated and tightly restricted.",
-  9200: "An Elasticsearch HTTP port is reported. Verify that authentication and access controls prevent public data exposure.",
-  27017: "MongoDB is reported. Verify that the database is not publicly accessible without strong access controls.",
-  6379: "Redis is reported. Verify authentication and firewall rules; do not assume public exposure is safe.",
+  5900: "VNC is reported. Restrict access and verify encryption and authentication.",
+  2375: "A Docker API port is reported. Verify remote access is authenticated and tightly restricted.",
+  9200: "An Elasticsearch HTTP port is reported. Verify authentication and access controls.",
+  27017: "MongoDB is reported. Verify the database is not publicly accessible without strong access controls.",
+  6379: "Redis is reported. Verify authentication and firewall rules.",
   3306: "MySQL is reported. Database access should normally be restricted to trusted hosts.",
   5432: "PostgreSQL is reported. Database access should normally be restricted to trusted hosts."
 };
@@ -1117,15 +943,13 @@ function renderPortAdvisories(db) {
   container.replaceChildren();
 
   const ports = getReportedPorts(db);
-  const flagged = ports.filter(
-    port => PORT_ADVISORIES[port]
-  );
+  const flagged = ports.filter(port => PORT_ADVISORIES[port]);
 
   if (!flagged.length) {
     container.className = "security-empty";
 
     container.textContent = ports.length
-      ? "No ports in this basic advisory list were reported. This does not mean that every service is secure."
+      ? "No ports in this basic advisory list were reported. This does not mean all services are secure."
       : "No ports were reported by InternetDB, so there are no port indicators to display.";
 
     return 0;
@@ -1137,165 +961,375 @@ function renderPortAdvisories(db) {
 
   flagged.forEach(port => {
     list.appendChild(
-      el(
-        "li",
-        "",
-        `Port ${port}: ${PORT_ADVISORIES[port]}`
-      )
+      el("li", "", `Port ${port}: ${PORT_ADVISORIES[port]}`)
     );
   });
 
-  container.appendChild(list);
-
-  container.appendChild(
+  container.append(
+    list,
     el(
       "p",
       "security-note",
-      "These are review prompts based on indexed port data, not confirmed vulnerabilities. InternetDB data can be stale and this tool does not test whether a service is currently reachable."
+      "These are review prompts based on indexed port data, not confirmed vulnerabilities. InternetDB data may be stale and this tool does not test current reachability."
     )
   );
 
   return flagged.length;
 }
 
-function renderSecurityAnalysis(db, cveDetails) {
+async function getCveDetails(id, signal) {
+  if (cveCache.has(id)) {
+    return cveCache.get(id);
+  }
+
+  const result = await optionalJSON(
+    `${CVEDB_API}/cve/${encodeURIComponent(id)}`,
+    signal
+  );
+
+  if (!result._sourceError && recordId(result)) {
+    cveCache.set(id, result);
+    return result;
+  }
+
+  return {
+    cve_id: id,
+    _sourceError: result._sourceError || "No record returned"
+  };
+}
+
+async function getDirectCveRecords(ids, signal) {
+  const chosen = ids.slice(0, MAX_DIRECT_CVES);
+
+  const records = await Promise.all(
+    chosen.map(id => getCveDetails(id, signal))
+  );
+
+  return {
+    records,
+    truncated: ids.length > chosen.length
+  };
+}
+
+async function getProductCveMatches(rawCpes, signal) {
+  const inputCpes = Array.isArray(rawCpes) ? rawCpes : [];
+
+  const cpes = [
+    ...new Set(
+      inputCpes.map(normalizeCpe23).filter(Boolean)
+    )
+  ].slice(0, MAX_CPE_QUERIES);
+
+  if (!cpes.length) {
+    return {
+      records: [],
+      queried: 0,
+      failed: false,
+      truncatedCpes: false
+    };
+  }
+
+  const settled = await Promise.all(
+    cpes.map(async cpe => {
+      const cached = cpeCache.get(cpe);
+
+      if (cached && Date.now() - cached.time < CACHE_TTL) {
+        return cached.records;
+      }
+
+      const url =
+        `${CVEDB_API}/cves?cpe23=${encodeURIComponent(cpe)}&limit=20`;
+
+      const payload = await optionalJSON(url, signal);
+
+      if (payload._sourceError) {
+        return {
+          _sourceError: true,
+          records: []
+        };
+      }
+
+      const records = Array.isArray(payload.cves)
+        ? payload.cves
+        : Array.isArray(payload)
+          ? payload
+          : [];
+
+      cpeCache.set(cpe, {
+        time: Date.now(),
+        records
+      });
+
+      return records;
+    })
+  );
+
+  let failed = false;
+  const unique = new Map();
+
+  settled.forEach(result => {
+    if (result && result._sourceError) {
+      failed = true;
+      return;
+    }
+
+    (Array.isArray(result) ? result : []).forEach(record => {
+      const id = recordId(record);
+
+      if (id && !unique.has(id)) {
+        unique.set(id, record);
+      }
+    });
+  });
+
+  const sorted = [...unique.values()].sort(
+    (a, b) => Number(b.cvss || 0) - Number(a.cvss || 0)
+  );
+
+  return {
+    records: sorted.slice(0, MAX_PRODUCT_CVES),
+    queried: cpes.length,
+    failed,
+    truncatedCpes: inputCpes.length > cpes.length
+  };
+}
+
+async function getGlobalKev(signal) {
+  if (kevCache && Date.now() - kevCacheTime < CACHE_TTL) {
+    return {
+      records: kevCache,
+      failed: false
+    };
+  }
+
+  const payload = await optionalJSON(
+    `${CVEDB_API}/cves?is_kev=true&sort_by_epss=true&limit=${MAX_KEV_CVES}`,
+    signal
+  );
+
+  if (payload._sourceError) {
+    return {
+      records: [],
+      failed: true
+    };
+  }
+
+  const records = Array.isArray(payload.cves)
+    ? payload.cves
+    : Array.isArray(payload)
+      ? payload
+      : [];
+
+  kevCache = records.slice(0, MAX_KEV_CVES);
+  kevCacheTime = Date.now();
+
+  return {
+    records: kevCache,
+    failed: false
+  };
+}
+
+function renderCveSection(container, records, mode, emptyMessage) {
+  container.replaceChildren();
+
+  const valid = (records || []).filter(
+    record => record && (recordId(record) || record._sourceError)
+  );
+
+  if (!valid.length) {
+    container.appendChild(
+      el("div", "security-empty", emptyMessage)
+    );
+    return;
+  }
+
+  valid.forEach(record => {
+    if (record._sourceError) {
+      const card = el("article", "cve-card");
+      const header = el("div", "cve-card-header");
+
+      const link = safeExternalLink(
+        cveUrl(record.cve_id),
+        record.cve_id
+      );
+
+      if (link) header.appendChild(link);
+
+      card.append(
+        header,
+        el(
+          "p",
+          "cve-description",
+          `${record.cve_id}: CVEDB could not return details. Open the NVD record to review it.`
+        )
+      );
+
+      container.appendChild(card);
+    } else {
+      container.appendChild(
+        renderCveCard(record, mode)
+      );
+    }
+  });
+}
+
+function renderSecurityAnalysis(db, directData, productData, kevData) {
   ensureSecurityPanel();
 
   const summary = $("security-summary");
-  const riskNote = $("security-risk-note");
-  const cveList = $("cve-list");
+  const note = $("security-risk-note");
 
-  const detailsById = new Map(
-    cveDetails.map(detail => [detail.id, detail])
-  );
+  const direct = directData.records || [];
+  const products = productData.records || [];
+  const kevs = kevData.records || [];
 
-  const ids = getCveIds(db.vulns);
+  const reportedIds = getCveIds(db.vulns);
 
-  const scored = cveDetails.filter(detail =>
-    detail &&
-    detail.found &&
-    String(detail.status || "").toLowerCase() !== "rejected" &&
-    detail.cvss
-  );
+  const directScores = direct
+    .filter(record =>
+      !record._sourceError &&
+      record.cvss !== null &&
+      record.cvss !== undefined &&
+      Number.isFinite(Number(record.cvss))
+    )
+    .map(record => Number(record.cvss));
 
-  const highest = scored.reduce(
-    (best, detail) =>
-      !best || detail.cvss.score > best.cvss.score
-        ? detail
-        : best,
-    null
-  );
+  const productScores = products
+    .filter(record =>
+      record.cvss !== null &&
+      record.cvss !== undefined &&
+      Number.isFinite(Number(record.cvss))
+    )
+    .map(record => Number(record.cvss));
+
+  const allHostRelatedScores = [
+    ...directScores,
+    ...productScores
+  ];
+
+  const highest = allHostRelatedScores.length
+    ? Math.max(...allHostRelatedScores)
+    : null;
+
+  const productKevCount = products.filter(
+    record => record.kev === true
+  ).length;
 
   const portIndicators = renderPortAdvisories(db);
-
-  const highOrCritical = scored.filter(
-    detail => detail.cvss.score >= 7
-  ).length;
-
-  const unqueried = cveDetails.filter(
-    detail => detail.notQueried
-  ).length;
-
-  const failed = cveDetails.filter(
-    detail => detail.lookupError
-  ).length;
 
   summary.replaceChildren();
 
   summary.append(
     makeMetric(
-      "Reported CVEs",
-      ids.length,
-      "From Shodan InternetDB"
+      "Host CVEs",
+      reportedIds.length,
+      "Directly reported by InternetDB"
     ),
     makeMetric(
-      "CVEs with CVSS",
-      scored.length,
-      "Enriched successfully in this session"
+      "Potential CPE matches",
+      products.length,
+      "Product associations; not confirmed"
     ),
     makeMetric(
       "Highest CVSS",
-      highest
-        ? highest.cvss.score.toFixed(1)
-        : (ids.length ? "Unrated" : "N/A"),
-      highest
-        ? `${highest.id} · ${highest.cvss.severity}`
-        : "No usable NVD score available"
+      highest === null ? "N/A" : highest.toFixed(1),
+      "Among host/CPE results only; global KEV excluded"
     )
   );
 
-  riskNote.replaceChildren();
+  const paragraphs = [];
 
-  let summaryText;
-
-  if (highest) {
-    summaryText =
-      `Highest score observed among the CVEs enriched in this pass: ` +
-      `${highest.cvss.score.toFixed(1)} (${highest.cvss.severity}), ` +
-      `from ${highest.id}. ${highOrCritical} enriched CVE(s) have ` +
-      `a CVSS score of 7.0 or higher. This is vulnerability intelligence, ` +
-      `not proof that the scanned host runs an affected product version.`;
-  } else if (ids.length) {
-    summaryText =
-      "InternetDB reported CVE identifiers, but no usable CVSS score was available from the CVEs enriched in this pass. Treat the result as unassessed, not low risk.";
+  if (reportedIds.length) {
+    paragraphs.push(
+      `InternetDB reported ${reportedIds.length} CVE identifier(s). CVEDB details were retrieved for up to ${MAX_DIRECT_CVES}.`
+    );
   } else {
-    summaryText =
-      "InternetDB did not report CVE identifiers for this IP. This is not proof that the host is free of vulnerabilities.";
+    paragraphs.push(
+      "InternetDB did not report CVE identifiers for this IP. That alone does not prove the host is free of vulnerabilities."
+    );
+  }
+
+  if (products.length) {
+    paragraphs.push(
+      `${products.length} potential CVE match(es) were found through product/CPE associations. They may not apply to the software version actually running on this host.`
+    );
+  } else if (productData.queried) {
+    paragraphs.push(
+      "No matching CVEs were returned for the CPE identifiers queried. This is not a guarantee that the products are secure."
+    );
+  } else {
+    paragraphs.push(
+      "No usable CPE identifiers were available for product-associated CVE lookups."
+    );
   }
 
   if (portIndicators) {
-    summaryText +=
-      ` ${portIndicators} port-based review indicator(s) were also reported below; ` +
-      "port numbers alone do not prove a vulnerability.";
+    paragraphs.push(
+      `${portIndicators} indexed-port review indicator(s) are shown below; port numbers alone do not confirm a vulnerability.`
+    );
   }
 
-  riskNote.textContent = summaryText;
+  if (productKevCount) {
+    paragraphs.push(
+      `${productKevCount} potential product match(es) are flagged in CVEDB as KEV; verify affected product/version before drawing conclusions.`
+    );
+  }
 
-  cveList.replaceChildren();
+  note.textContent = paragraphs.join(" ");
 
-  if (!ids.length) {
-    cveList.appendChild(
+  renderCveSection(
+    $("host-cve-list"),
+    direct,
+    "direct",
+    reportedIds.length
+      ? "No detailed records were available from CVEDB for the reported identifiers."
+      : "No CVE identifiers were reported by InternetDB for this IP."
+  );
+
+  renderCveSection(
+    $("product-cve-list"),
+    products,
+    "product",
+    productData.failed
+      ? "CPE lookup was partly unavailable. This is not a clean bill of health."
+      : "No potential CPE-associated CVEs were returned for the indexed product identifiers."
+  );
+
+  renderCveSection(
+    $("global-kev-list"),
+    kevs,
+    "kev",
+    kevData.failed
+      ? "The global KEV feed could not be loaded in this session."
+      : "No global KEV records were returned by the feed."
+  );
+
+  const badge = securityPanel.querySelector(
+    ".panel-heading .count-badge"
+  );
+
+  if (badge) {
+    badge.textContent =
+      `${reportedIds.length} host CVE${reportedIds.length === 1 ? "" : "s"} · ${products.length} possible match${products.length === 1 ? "" : "es"}`;
+  }
+
+  if (directData.truncated) {
+    $("host-cve-list").appendChild(
       el(
-        "div",
-        "security-empty",
-        "No CVE identifiers were reported by InternetDB for this IP."
+        "p",
+        "security-note",
+        `Only the first ${MAX_DIRECT_CVES} directly reported CVEs were enriched in this lookup.`
       )
     );
-  } else {
-    ids.forEach(id => {
-      cveList.appendChild(
-        renderCveCard(id, detailsById.get(id))
-      );
-    });
   }
 
-  const headingBadge =
-    securityPanel.querySelector(
-      ".panel-heading .count-badge"
-    );
-
-  if (headingBadge) {
-    headingBadge.textContent =
-      `${ids.length} reported CVE${ids.length === 1 ? "" : "s"}`;
-  }
-
-  const notes = [];
-
-  if (unqueried) {
-    notes.push(
-      `${unqueried} CVE(s) were not queried because the conservative unauthenticated NVD request budget was reached.`
-    );
-  }
-
-  if (failed) {
-    notes.push(
-      `${failed} CVE lookup(s) could not be completed; the relevant cards show the limitation.`
-    );
-  }
-
-  if (notes.length) {
-    cveList.appendChild(
-      el("p", "security-note", notes.join(" "))
+  if (productData.truncatedCpes) {
+    $("product-cve-list").appendChild(
+      el(
+        "p",
+        "security-note",
+        `Only the first ${MAX_CPE_QUERIES} CPE identifiers were queried to keep the lookup lightweight.`
+      )
     );
   }
 }
@@ -1306,7 +1340,6 @@ async function lookup(ip) {
       "Enter a valid IPv4 address, e.g. 8.8.8.8.",
       "error"
     );
-
     ipInput.focus();
     return;
   }
@@ -1316,31 +1349,29 @@ async function lookup(ip) {
       "Enter a public IPv4 address. Private and special-use IP ranges are not sent to third-party services.",
       "error"
     );
-
     ipInput.focus();
     return;
   }
 
-  if (controller) controller.abort();
+  if (activeController) {
+    activeController.abort();
+  }
 
-  controller = new AbortController();
+  activeController = new AbortController();
 
-  const current = controller;
-
-  let sourceTimeout = setTimeout(
+  const current = activeController;
+  const sourceTimeout = setTimeout(
     () => current.abort(),
-    20000
+    25000
   );
-
-  let nvdTimeout = null;
-  let nvdController = null;
-  let cancelNvdOnNewLookup = null;
 
   searchButton.disabled = true;
   buttonLabel.textContent = "Analyzing...";
   results.hidden = true;
 
-  showStatus("Collecting public host and network data...");
+  showStatus(
+    "Collecting public host, network and vulnerability intelligence..."
+  );
 
   const encodedIP = encodeURIComponent(ip);
 
@@ -1364,10 +1395,7 @@ async function lookup(ip) {
       )
     ]);
 
-    if (controller !== current) return;
-
-    clearTimeout(sourceTimeout);
-    sourceTimeout = null;
+    if (activeController !== current) return;
 
     if (
       dbResult._sourceError &&
@@ -1375,70 +1403,35 @@ async function lookup(ip) {
       atlasResult._sourceError
     ) {
       throw new Error(
-        "All sources failed. Check your internet connection or source availability."
+        "All public-data sources failed. Check your connection or try again later."
       );
     }
 
-    const db = dbResult._sourceError
-      ? {}
-      : dbResult;
+    const db = dbResult._sourceError ? {} : dbResult;
+    const geo = geoResult._sourceError ? {} : geoResult;
+    const atlas = atlasResult._sourceError ? {} : atlasResult;
 
-    const geo = geoResult._sourceError
-      ? {}
-      : geoResult;
-
-    const atlas = atlasResult._sourceError
-      ? {}
-      : atlasResult;
-
-    const cveIds = getCveIds(db.vulns);
+    const ids = getCveIds(db.vulns);
 
     showStatus(
-      cveIds.length
-        ? `Public data received. Enriching up to ${NVD_REQUEST_BUDGET} CVE records with NVD...`
-        : "Public data received. Preparing the security report..."
+      "Public data received. Enriching reported CVEs, CPE matches and global KEV intelligence..."
     );
 
-    nvdController = new AbortController();
+    const [
+      directData,
+      productData,
+      kevData
+    ] = await Promise.all([
+      getDirectCveRecords(ids, current.signal),
+      getProductCveMatches(db.cpes, current.signal),
+      getGlobalKev(current.signal)
+    ]);
 
-    cancelNvdOnNewLookup = () => {
-      if (nvdController) nvdController.abort();
-    };
-
-    current.signal.addEventListener(
-      "abort",
-      cancelNvdOnNewLookup,
-      { once: true }
-    );
-
-    nvdTimeout = setTimeout(
-      () => nvdController.abort(),
-      12000
-    );
-
-    const cveDetails = await enrichCveIds(
-      cveIds,
-      nvdController.signal
-    );
-
-    clearTimeout(nvdTimeout);
-    nvdTimeout = null;
-
-    if (cancelNvdOnNewLookup) {
-      current.signal.removeEventListener(
-        "abort",
-        cancelNvdOnNewLookup
-      );
-
-      cancelNvdOnNewLookup = null;
-    }
-
-    if (controller !== current) return;
+    if (activeController !== current) return;
 
     results.hidden = false;
 
     resultIP.textContent = ip;
-
     shodanLink.href =
       "https://www.shodan.io/host/" + encodedIP;
 
@@ -1448,28 +1441,35 @@ async function lookup(ip) {
     renderOverview(ip, db, geo, atlas);
     renderPorts(db);
     renderRecords(db);
-    renderSecurityAnalysis(db, cveDetails);
 
-    const successful = [
+    renderSecurityAnalysis(
+      db,
+      directData,
+      productData,
+      kevData
+    );
+
+    const successfulSources = [
       !dbResult._sourceError,
       !geoResult._sourceError,
       !atlasResult._sourceError
     ].filter(Boolean).length;
 
-    const nvdProblems = cveDetails.some(
-      detail => detail.lookupError || detail.notQueried
-    );
+    const cveProblems =
+      directData.records.some(record => record._sourceError) ||
+      productData.failed ||
+      kevData.failed;
 
-    if (successful === 3) {
+    if (successfulSources === 3) {
       showStatus(
-        nvdProblems
-          ? "Lookup completed. Public host data loaded; CVE enrichment is partial. See the security report for details."
-          : "Lookup completed. Public host data and available CVE enrichment loaded.",
+        cveProblems
+          ? "Lookup completed with partial vulnerability intelligence. Review the source notes below."
+          : "Lookup completed. Public host and passive vulnerability intelligence loaded.",
         "success"
       );
     } else {
       showStatus(
-        `Lookup completed with partial host data (${successful}/3 sources). Some providers may be unavailable; review the source notes and security report.`,
+        `Lookup completed with partial public data (${successfulSources}/3 host sources). Some data providers may be unavailable.`,
         "error"
       );
     }
@@ -1479,57 +1479,51 @@ async function lookup(ip) {
       block: "start"
     });
   } catch (error) {
-    if (controller === current) {
+    if (activeController === current) {
       showStatus(
-        error.name === "AbortError"
-          ? "The host lookup timed out. Please try again."
-          : error.message || "Lookup failed.",
+        error && error.name === "AbortError"
+          ? "The lookup timed out. Please try again."
+          : (error && error.message) || "Lookup failed.",
         "error"
       );
     }
   } finally {
-    if (sourceTimeout) clearTimeout(sourceTimeout);
-    if (nvdTimeout) clearTimeout(nvdTimeout);
+    clearTimeout(sourceTimeout);
 
-    if (cancelNvdOnNewLookup) {
-      current.signal.removeEventListener(
-        "abort",
-        cancelNvdOnNewLookup
-      );
-    }
-
-    if (controller === current) {
-      controller = null;
+    if (activeController === current) {
+      activeController = null;
       searchButton.disabled = false;
       buttonLabel.textContent = "Analyze IP";
     }
   }
 }
 
-// Update the existing panel labels without changing index.html.
+// Re-label the older record panel without changing index.html or style.css.
+const oldBannerPanel = bannersContainer.closest(".panel");
+
 const oldBannerHeading =
-  bannersContainer.closest(".panel")?.querySelector("h3");
+  oldBannerPanel && oldBannerPanel.querySelector("h3");
 
 if (oldBannerHeading) {
   oldBannerHeading.textContent = "Additional intelligence";
 }
 
 const oldBannerDescription =
-  bannersContainer.closest(".panel")
-    ?.querySelector(".panel-description");
+  oldBannerPanel &&
+  oldBannerPanel.querySelector(".panel-description");
 
 if (oldBannerDescription) {
   oldBannerDescription.textContent =
     "Hostnames, detected technologies (CPEs) and tags reported by InternetDB.";
 }
 
+const serviceCard = serviceCount.closest(".stat-card");
+
 const serviceLabel =
-  serviceCount.closest(".stat-card")
-    ?.querySelector(".stat-label");
+  serviceCard && serviceCard.querySelector(".stat-label");
 
 const serviceNote =
-  serviceCount.closest(".stat-card")
-    ?.querySelector(".stat-note");
+  serviceCard && serviceCard.querySelector(".stat-note");
 
 if (serviceLabel) {
   serviceLabel.textContent = "Intel Records";
